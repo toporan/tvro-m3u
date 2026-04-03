@@ -2,12 +2,12 @@ name: Filter and Update Romanian TV M3U
 
 on:
   schedule:
-    - cron: '0 */6 * * *'  # Every 6 hours
+    - cron: '0 */6 * * *'
   workflow_dispatch:
   push:
     branches: [ main ]
 
-# Fix: Prevent infinite loops when action pushes commits
+# Fix: Prevent concurrent runs and infinite loops
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
@@ -16,21 +16,23 @@ jobs:
   filter-and-update:
     runs-on: ubuntu-latest
     
-    # Fix: Skip if last commit was from this action (prevent loops)
+    # Fix: Skip if last commit was from this action
     if: ${{ !contains(github.event.head_commit.message, '[skip ci]') }}
     
-    # Fix: Force Node.js 24 to suppress deprecation warnings
-    env:
-      FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+    # Fix: CRITICAL - Grant write permissions to the bot
+    permissions:
+      contents: write  # Required for git push [^53^][^61^]
     
     steps:
     - name: Checkout repository
-      uses: actions/checkout@v5  # Updated to v5 (Node.js 24) [^42^]
+      uses: actions/checkout@v4
       with:
-        fetch-depth: 0  # Full history for proper git operations
+        fetch-depth: 0
+        # Fix: Ensure credentials persist for git push
+        persist-credentials: true
         
     - name: Set up Python
-      uses: actions/setup-python@v5
+      uses: actions/setup-python@v6  # Updated to v6 (Node.js 24) [^43^][^57^]
       with:
         python-version: '3.11'
         
@@ -38,49 +40,47 @@ jobs:
       run: |
         sudo apt-get update
         sudo apt-get install -y ffmpeg
-        echo "FFprobe version:"
-        ffprobe -version | head -1
         
     - name: Install Python dependencies
       run: |
         python -m pip install --upgrade pip
         pip install requests
         
-    - name: Run validator (filters dead channels)
+    - name: Run validator
       run: |
         python scripts/validator.py
-        echo "Validator exit code: $?"
+        echo "Exit code: $?"
         
-    - name: Verify playlist was created
+    - name: Verify playlist exists
       run: |
         if [ ! -f romania_tv.m3u ]; then
-          echo "❌ ERROR: romania_tv.m3u was not created!"
+          echo "❌ ERROR: romania_tv.m3u not created!"
+          ls -la
           exit 1
         fi
         WORKING=$(grep -c '^http' romania_tv.m3u || echo "0")
-        echo "✅ Working channels in playlist: $WORKING"
-        if [ "$WORKING" -eq "0" ]; then
-          echo "⚠️ WARNING: No working channels found!"
-          # Don't fail - keep previous playlist
-          exit 0
-        fi
+        echo "✅ Working channels: $WORKING"
+        
+    - name: Configure git
+      run: |
+        git config --local user.email "github-actions[bot]@users.noreply.github.com"
+        git config --local user.name "github-actions[bot]"
         
     - name: Check for changes
       id: check_changes
       run: |
-        git add romania_tv.m3u health_report.json dead_channels.m3u
+        git add romania_tv.m3u health_report.json dead_channels.m3u 2>/dev/null || true
         if git diff --cached --quiet; then
-          echo "No changes to commit"
           echo "changed=false" >> $GITHUB_OUTPUT
+          echo "No changes to commit"
         else
-          echo "Changes detected"
           echo "changed=true" >> $GITHUB_OUTPUT
+          echo "Changes detected"
         fi
         
-    - name: Commit and push filtered playlist
+    - name: Commit and push
       if: steps.check_changes.outputs.changed == 'true'
       run: |
-        git config --local user.email "action@github.com"
-        git config --local user.name "GitHub Action"
-        git commit -m "🔥 Filter: Remove dead channels [$(date +%Y-%m-%d %H:%M)] [skip ci]"
-        git push
+        git commit -m "🔥 Auto-filter dead channels [$(date +%Y-%m-%d %H:%M)] [skip ci]"
+        # Fix: Use GITHUB_TOKEN for authentication
+        git push https://${{ github.token }}@github.com/${{ github.repository }}.git HEAD:${{ github.ref }}
