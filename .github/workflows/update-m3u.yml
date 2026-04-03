@@ -1,45 +1,86 @@
-name: Update and Validate Romanian TV M3U
+name: Filter and Update Romanian TV M3U
 
 on:
   schedule:
-    # Run every 6 hours (adjust as needed)
-    - cron: '0 */6 * * *'
-  workflow_dispatch:  # Allow manual trigger
+    - cron: '0 */6 * * *'  # Every 6 hours
+  workflow_dispatch:
   push:
     branches: [ main ]
 
+# Fix: Prevent infinite loops when action pushes commits
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
-  update-and-validate:
+  filter-and-update:
     runs-on: ubuntu-latest
+    
+    # Fix: Skip if last commit was from this action (prevent loops)
+    if: ${{ !contains(github.event.head_commit.message, '[skip ci]') }}
+    
+    # Fix: Force Node.js 24 to suppress deprecation warnings
+    env:
+      FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
     
     steps:
     - name: Checkout repository
-      uses: actions/checkout@v4
-      
+      uses: actions/checkout@v5  # Updated to v5 (Node.js 24) [^42^]
+      with:
+        fetch-depth: 0  # Full history for proper git operations
+        
     - name: Set up Python
       uses: actions/setup-python@v5
       with:
         python-version: '3.11'
         
-    - name: Install dependencies
+    - name: Install ffmpeg
       run: |
-        python -m pip install --upgrade pip
-        pip install -r requirements.txt
         sudo apt-get update
         sudo apt-get install -y ffmpeg
+        echo "FFprobe version:"
+        ffprobe -version | head -1
         
-    - name: Fetch latest Romanian channels from IPTV-Org
+    - name: Install Python dependencies
       run: |
-        # Download fresh Romanian playlist from IPTV-Org
-        curl -L -o sources/iptv-org-ro.m3u https://iptv-org.github.io/iptv/countries/ro.m3u
+        python -m pip install --upgrade pip
+        pip install requests
         
-    - name: Run health check and update playlist
-      run: python scripts/validator.py
-      
-    - name: Commit and push if changed
+    - name: Run validator (filters dead channels)
+      run: |
+        python scripts/validator.py
+        echo "Validator exit code: $?"
+        
+    - name: Verify playlist was created
+      run: |
+        if [ ! -f romania_tv.m3u ]; then
+          echo "❌ ERROR: romania_tv.m3u was not created!"
+          exit 1
+        fi
+        WORKING=$(grep -c '^http' romania_tv.m3u || echo "0")
+        echo "✅ Working channels in playlist: $WORKING"
+        if [ "$WORKING" -eq "0" ]; then
+          echo "⚠️ WARNING: No working channels found!"
+          # Don't fail - keep previous playlist
+          exit 0
+        fi
+        
+    - name: Check for changes
+      id: check_changes
+      run: |
+        git add romania_tv.m3u health_report.json dead_channels.m3u
+        if git diff --cached --quiet; then
+          echo "No changes to commit"
+          echo "changed=false" >> $GITHUB_OUTPUT
+        else
+          echo "Changes detected"
+          echo "changed=true" >> $GITHUB_OUTPUT
+        fi
+        
+    - name: Commit and push filtered playlist
+      if: steps.check_changes.outputs.changed == 'true'
       run: |
         git config --local user.email "action@github.com"
         git config --local user.name "GitHub Action"
-        git add -A
-        git diff --quiet && git diff --staged --quiet || git commit -m "Auto-update: Refresh streams and validate channels [$(date +%Y-%m-%d)]"
+        git commit -m "🔥 Filter: Remove dead channels [$(date +%Y-%m-%d %H:%M)] [skip ci]"
         git push
